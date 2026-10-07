@@ -306,6 +306,7 @@ def main():
     ap.add_argument("--bundles", action="store_true", help="List discounted Steam bundles/editions that include each shown game")
     ap.add_argument("--gg-cache", metavar="JSON", help="Reuse gg.deals prices between runs; fetch at most --gg-budget IDs per run")
     ap.add_argument("--gg-budget", type=int, default=300, help="Max IDs fetched from gg.deals per run with --gg-cache (default 300)")
+    ap.add_argument("--gg-max-age", type=float, default=12, metavar="HOURS", help="With --gg-cache, refetch prices older than this (default 12)")
     ap.add_argument("--discord", action="store_true", help="Post results to DISCORD_WEBHOOK from .env")
     ap.add_argument("--min-score", type=float, default=0, help="Drop rows below this score (2.0 = good game near its low)")
     ap.add_argument("--buy-now", type=float, default=None, metavar="PCT", help="Only show rows within PCT%% of historical low (e.g. 20)")
@@ -341,7 +342,7 @@ def main():
         for c in cands:
             c["rating"], c["reviews"], c["year"] = info.get(c["appid"], (0, 0, None))
             if c["appid"] in ip: c["retail"], c["normal"] = ip[c["appid"]][:2], ip[c["appid"]][2]
-    prices = gg_prices(key, [c["appid"] for c in cands], a.gg_cache, a.gg_budget if a.gg_cache else None)
+    prices = gg_prices(key, [c["appid"] for c in cands], a.gg_cache, a.gg_budget if a.gg_cache else None, a.gg_max_age)
     rows = []
     for c in cands:
         sk = c.pop("retail", None)
