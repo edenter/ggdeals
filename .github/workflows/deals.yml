@@ -18,6 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/checkout@v7
+        id: data
         with:
           repository: edenter/ggdeals-data
           ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
@@ -42,7 +43,7 @@ jobs:
           echo "rc=$rc" >> "$GITHUB_ENV"
           echo "find_deals.py exit code $rc (output in ggdeals-data/run.log)"
       - name: Save history and log to ggdeals-data
-        if: always()
+        if: always() && steps.data.outcome == 'success'
         working-directory: data
         run: |
           git config user.name "github-actions[bot]"
