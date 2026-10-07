@@ -388,8 +388,11 @@ def main():
             label = f"New deals ({len(post)}) - {len(rows[:a.top]) - len(post)} still on sale from before"
         else:
             label = f"{label} ({len(post)})"
-        discord_post(hook, label, post, bundles)
-        print("Posted to Discord")
+        if a.state and not post:
+            print("Nothing new; not posting to Discord")   # everything listed was already announced
+        else:
+            discord_post(hook, label, post, bundles)
+            print("Posted to Discord")
         if a.state:
             for r in post: state[r["appid"]] = {"best": r["best"], "date": today, "title": r["title"]}
             with open(a.state, "w", encoding="utf-8") as fh: json.dump(state, fh, indent=1, sort_keys=True)
