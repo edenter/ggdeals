@@ -1,10 +1,10 @@
 """
-Steam deal finder: CheapShark (discovery + quality) -> gg.deals (store vs keyshop + historical lows) -> Discord
+Steam deal finder: IsThereAnyDeal (discovery + store prices) + Steam (reviews) -> gg.deals (keyshops + historical lows) -> Discord
 
 Usage:
   python find_deals.py                       # top deals, default filters
   python find_deals.py --min-rating 90 --min-reviews 5000 --max-price 15
-  python find_deals.py --pages 5 --csv out.csv
+  python find_deals.py --pages 5 --csv out.csv  # 200 deals per page
   python find_deals.py --ids 1245620 413150  # check specific Steam AppIDs
   python find_deals.py --wishlist            # price-check your Steam wishlist
   python find_deals.py --buy-now 20          # only rows within 20% of historical low
@@ -13,17 +13,15 @@ Usage:
   python find_deals.py --wishlist --discord  # post results to a Discord webhook
   python find_deals.py --discord --state history/posted.json  # only post deals not announced before
   python find_deals.py --steam-keys          # store price only from shops selling Steam keys (no GOG/Epic/Ubisoft)
-  python find_deals.py --stores 1            # discover only games on sale at Steam (fewer repeat rows, reaches deeper)
   python find_deals.py --gg-cache history/gg_cache.json  # reuse gg.deals prices; fetch at most 300 IDs per run
   python find_deals.py --bundles             # also list discounted Steam bundles/editions that include each game
 
-Env (.env or environment): GGDEALS_API_KEY (required); STEAM_API_KEY, STEAM_ID (steam64); DISCORD_WEBHOOK.
+Env (.env or environment): ITAD_API_KEY, GGDEALS_API_KEY (required); STEAM_API_KEY, STEAM_ID (steam64); DISCORD_WEBHOOK.
 """
 import argparse, csv, datetime, glob, json, math, os, sys, time, urllib.error, urllib.parse, urllib.request
 
 UA = "ggdeals-finder/1.0 (personal use)"
-CS = "https://www.cheapshark.com/api/1.0/deals"
-CS_GAMES = "https://www.cheapshark.com/api/1.0/games"
+ITAD = "https://api.isthereanydeal.com"
 GG = "https://api.gg.deals/v1/prices/by-steam-app-id/"
 
 def load_env():
@@ -34,8 +32,12 @@ def load_env():
                 k, v = line.strip().split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-def get(url, params, retries=6):
-    req = urllib.request.Request(url + "?" + urllib.parse.urlencode(params), headers={"User-Agent": UA})
+def get(url, params, retries=6, body=None, headers=None):
+    """GET (or POST `body` as JSON) and parse the JSON reply. A 429 waits out its Retry-After, or fails at once if
+    that is over 5 minutes - retrying into a long ban only extends it."""
+    data = json.dumps(body).encode() if body is not None else None
+    hdrs = {"User-Agent": UA, **({"Content-Type": "application/json"} if data else {}), **(headers or {})}
+    req = urllib.request.Request(url + "?" + urllib.parse.urlencode(params), data=data, headers=hdrs)
     for attempt in range(retries + 1):
         backoff = min(30 * 2 ** attempt, 300)             # 30s..5min, ~17min total: ride out short outages
         try:
@@ -43,7 +45,10 @@ def get(url, params, retries=6):
                 return json.load(r)
         except urllib.error.HTTPError as e:
             if (e.code != 429 and e.code < 500) or attempt == retries: raise
-            wait = 65 * (attempt + 1) if e.code == 429 else backoff
+            ra = e.headers.get("Retry-After", "") if e.code == 429 else ""
+            if ra.isdigit() and int(ra) > 300:
+                print(f"429 from {url.split('/')[2]}: blocked for {ra}s; giving up", file=sys.stderr); raise
+            wait = (int(ra) + 1 if ra.isdigit() else 65 * (attempt + 1)) if e.code == 429 else backoff
             print(f"{e.code} from {url.split('/')[2]}; waiting {wait}s", file=sys.stderr); time.sleep(wait)
         except (urllib.error.URLError, TimeoutError) as e:
             if attempt == retries: raise
@@ -53,43 +58,67 @@ def f(x):
     try: return float(x) if x not in (None, "") else None
     except ValueError: return None
 
-def cheapshark_candidates(pages, min_rating, min_reviews, max_price, stores=None):
-    # CheapShark lists one row per store, so a game on sale at 6 stores fills 6 rows; `stores` cuts those repeats
-    seen, out = {}, []
-    extra = {"storeID": stores} if stores else {}
-    for sort, page in [(s, p) for s in ("Deal Rating", "Metacritic") for p in range(pages)]:
-        rows = get(CS, {"sortBy": sort, "onSale": 1, "pageSize": 60, "pageNumber": page,
-                        "steamRating": min_rating, "upperPrice": max_price, **extra})
-        if not rows: continue
-        for d in rows:
-            app = d.get("steamAppID")
-            if not app or app in seen: continue
-            if int(d.get("steamRatingCount") or 0) < min_reviews: continue
-            seen[app] = True
-            out.append({"appid": app, "gameid": d["gameID"], "title": d["title"], "rating": int(d["steamRatingPercent"]),
-                        "reviews": int(d["steamRatingCount"]), "metacritic": int(d.get("metacriticScore") or 0),
-                        "normal": f(d["normalPrice"]), "year": time.gmtime(d["releaseDate"]).tm_year if d.get("releaseDate") else None})
-        time.sleep(0.3)
+# ITAD shops that sell Steam keys; leaves out GOG, Epic, Ubisoft, EA, Microsoft and the other launchers
+STEAM_KEY_SHOPS = {61: "Steam", 24: "GamersGate", 36: "GreenManGaming", 37: "Humble", 6: "Fanatical", 64: "WinGameStore",
+                   20: "GameBillet", 29: "Gamesplanet", 25: "Gamesload", 42: "IndieGala", 15: "DreamGame"}
+
+def itad(path, key, params=None, body=None):
+    return get(ITAD + path, {"country": "US", **(params or {})}, body=body, headers={"ITAD-API-Key": key})
+
+def steam_info(appids):
+    """{appid: (rating %, review count, release year)} from Steam's store, 50 games per call."""
+    out = {}
+    for it in steam_items([{"appid": int(a)} for a in appids], {"include_reviews": True, "include_release": True}):
+        rv = (it.get("reviews") or {}).get("summary_filtered") or {}
+        rel = (it.get("release") or {}).get("steam_release_date")
+        out[str(it["appid"])] = (int(rv.get("percent_positive") or 0), int(rv.get("review_count") or 0),
+                                 time.gmtime(rel).tm_year if rel else None)
     return out
 
-# CheapShark stores that sell Steam keys; leaves out GOG (7), Ubisoft (13) and Epic (25)
-STEAM_KEY_STORES = {"1": "Steam", "2": "GamersGate", "3": "GreenManGaming", "11": "Humble", "15": "Fanatical",
-                    "21": "WinGameStore", "23": "GameBillet", "27": "Gamesplanet", "28": "Gamesload", "30": "IndieGala", "35": "DreamGame"}
+def itad_candidates(key, pages, min_rating, min_reviews, max_price, shops=None):
+    """Games on sale with a Steam key, one row per game. ITAD filters by Steam reviews and price; each row's
+    `retail` is the cheapest current sale price among `shops` (all shops if None)."""
+    filt = {"price": {"min": None, "max": max_price}, "steamPerc": {"min": min_rating, "max": 100},
+            "steamCount": {"min": min_reviews, "max": None}, "drm": [61], "type": [1, 3]}   # 3 = package: ITAD files some games (e.g. Psychonauts 2) as packages
+    deals, offset = [], 0
+    for _ in range(pages):
+        r = itad("/deals/v2", key, body={"country": "US", "limit": 200, "offset": offset, "filter": filt,
+                                          **({"shops": shops} if shops else {})})
+        deals += r["list"]
+        if not r.get("hasMore"): break
+        offset = r["nextOffset"]
+    apps = {}
+    for i in range(0, len(deals), 200):                   # ITAD game ID -> Steam app ID
+        for gid, ids in itad("/lookup/shop/61/id/v1", key, body=[d["id"] for d in deals[i:i+200]]).items():
+            app = next((x[4:] for x in ids or [] if x.startswith("app/")), None)
+            if app: apps[gid] = app
+    info = steam_info(sorted(set(apps.values())))
+    out, seen = [], set()
+    for d in deals:
+        app = apps.get(d["id"])
+        if not app or app in seen or app not in info: continue
+        rating, reviews, year = info[app]
+        if rating < min_rating or reviews < min_reviews: continue   # Steam's own numbers, fresher than ITAD's
+        seen.add(app)
+        out.append({"appid": app, "title": d["title"], "rating": rating, "reviews": reviews, "metacritic": 0,
+                    "normal": d["deal"]["regular"]["amount"], "year": year,
+                    "retail": (d["deal"]["price"]["amount"], d["deal"]["shop"]["name"])})
+    return out
 
-def steam_key_prices(cands):
-    """{appid: (price, store)} - cheapest current price at a Steam-key store, per CheapShark."""
-    for c in cands:
-        if not c.get("gameid"):                           # --ids / --wishlist: look up CheapShark's game ID
-            r = get(CS_GAMES, {"steamAppID": c["appid"]})
-            c["gameid"] = r[0]["gameID"] if r else None; time.sleep(0.3)
-    by_game = {c["gameid"]: c["appid"] for c in cands if c.get("gameid")}
-    ids, out = list(by_game), {}
-    for i in range(0, len(ids), 25):                      # 25 games per call
-        for gid, g in get(CS_GAMES, {"ids": ",".join(ids[i:i+25])}).items():
-            deals = [(f(d["price"]), STEAM_KEY_STORES[d["storeID"]]) for d in g["deals"] if d["storeID"] in STEAM_KEY_STORES]
-            deals = [d for d in deals if d[0]]
-            if deals: out[by_game[gid]] = min(deals)
-        time.sleep(0.3)
+def itad_prices(key, appids, shops):
+    """{appid: (price, shop, regular price)} - cheapest current price among `shops`, for --ids / --wishlist."""
+    gids = {}
+    for i in range(0, len(appids), 200):
+        r = itad("/lookup/id/shop/61/v1", key, body=[f"app/{a}" for a in appids[i:i+200]])
+        gids.update({v: k[4:] for k, v in r.items() if v})
+    out, ids = {}, list(gids)
+    for i in range(0, len(ids), 200):
+        params = {"shops": ",".join(map(str, shops))} if shops else {}
+        for g in itad("/games/prices/v3", key, params, body=ids[i:i+200]):
+            ds = [d for d in g.get("deals", []) if d["price"]["amount"] > 0]
+            if ds:
+                d = min(ds, key=lambda d: d["price"]["amount"])
+                out[gids[g["id"]]] = (d["price"]["amount"], d["shop"]["name"], d["regular"]["amount"])
     return out
 
 def gg_prices(key, appids, cache_path=None, budget=None, max_age=12):
@@ -125,14 +154,6 @@ def steam_owned(key, sid):
 def steam_wishlist(key, sid):
     r = get(f"{STEAM}/IWishlistService/GetWishlist/v1/", {"key": key, "steamid": sid})
     return [str(i["appid"]) for i in r["response"].get("items", [])]
-
-def steam_reviews(appid):
-    try:
-        q = get(f"https://store.steampowered.com/appreviews/{appid}", {"json": 1, "language": "all", "purchase_type": "all", "num_per_page": 0})["query_summary"]
-        n = q.get("total_reviews", 0)
-        return (round(100 * q["total_positive"] / n) if n else 0, n)
-    except Exception:
-        return (0, 0)
 
 def steam_items(ids, request):
     """Steam store items for ids like {"appid": 1} / {"bundleid": 2} / {"packageid": 3}, 50 per call."""
@@ -270,11 +291,10 @@ def score(row):
 def main():
     load_env()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pages", type=int, default=3, help="CheapShark pages (60/page)")
+    ap.add_argument("--pages", type=int, default=20, help="ITAD deal pages (200/page)")
     ap.add_argument("--min-rating", type=int, default=85)
     ap.add_argument("--min-reviews", type=int, default=1000)
     ap.add_argument("--max-price", type=float, default=30)
-    ap.add_argument("--stores", metavar="IDS", help="Only discover deals at these CheapShark store IDs (e.g. 1 = Steam); prices still come from all shops")
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--ids", nargs="*", help="Specific Steam AppIDs instead of discovery")
     ap.add_argument("--csv")
@@ -282,7 +302,7 @@ def main():
     ap.add_argument("--wishlist", action="store_true", help="Check your Steam wishlist instead of discovery")
     ap.add_argument("--history", metavar="DIR", help="Folder of daily CSVs; flags deals that already hit this price in earlier sales")
     ap.add_argument("--state", metavar="JSON", help="Posted-deals state file; with --discord, only post deals not announced before")
-    ap.add_argument("--steam-keys", action="store_true", help="Store price only from shops selling Steam keys (CheapShark); keyshops unchanged")
+    ap.add_argument("--steam-keys", action="store_true", help="Store price only from shops selling Steam keys (ITAD); keyshops unchanged")
     ap.add_argument("--bundles", action="store_true", help="List discounted Steam bundles/editions that include each shown game")
     ap.add_argument("--gg-cache", metavar="JSON", help="Reuse gg.deals prices between runs; fetch at most --gg-budget IDs per run")
     ap.add_argument("--gg-budget", type=int, default=300, help="Max IDs fetched from gg.deals per run with --gg-cache (default 300)")
@@ -290,8 +310,9 @@ def main():
     ap.add_argument("--min-score", type=float, default=0, help="Drop rows below this score (2.0 = good game near its low)")
     ap.add_argument("--buy-now", type=float, default=None, metavar="PCT", help="Only show rows within PCT%% of historical low (e.g. 20)")
     a = ap.parse_args()
-    key = os.environ.get("GGDEALS_API_KEY")
-    if not key: sys.exit("Set GGDEALS_API_KEY in .env")
+    key, ikey = os.environ.get("GGDEALS_API_KEY"), os.environ.get("ITAD_API_KEY")
+    if not (key and ikey): sys.exit("Set GGDEALS_API_KEY and ITAD_API_KEY in .env")
+    shops = list(STEAM_KEY_SHOPS) if a.steam_keys else None
 
     skey, sid = os.environ.get("STEAM_API_KEY"), os.environ.get("STEAM_ID")
     owned = set()
@@ -311,18 +332,19 @@ def main():
     if a.ids:
         cands = [{"appid": i, "title": "?", "rating": 0, "reviews": 0, "metacritic": 0, "normal": None, "year": None} for i in a.ids]
     else:
-        cands = cheapshark_candidates(a.pages, a.min_rating, a.min_reviews, a.max_price, a.stores)
-        print(f"{len(cands)} candidates from CheapShark; querying gg.deals...", file=sys.stderr)
+        cands = itad_candidates(ikey, a.pages, a.min_rating, a.min_reviews, a.max_price, shops)
+        print(f"{len(cands)} candidates from IsThereAnyDeal; querying gg.deals...", file=sys.stderr)
 
     cands = [c for c in cands if c["appid"] not in owned]
     if a.ids:
+        info, ip = steam_info([c["appid"] for c in cands]), itad_prices(ikey, [c["appid"] for c in cands], shops)
         for c in cands:
-            c["rating"], c["reviews"] = steam_reviews(c["appid"]); time.sleep(0.2)
+            c["rating"], c["reviews"], c["year"] = info.get(c["appid"], (0, 0, None))
+            if c["appid"] in ip: c["retail"], c["normal"] = ip[c["appid"]][:2], ip[c["appid"]][2]
     prices = gg_prices(key, [c["appid"] for c in cands], a.gg_cache, a.gg_budget if a.gg_cache else None)
-    skeys = steam_key_prices(cands) if a.steam_keys else {}
     rows = []
     for c in cands:
-        c.pop("gameid", None)
+        sk = c.pop("retail", None)
         p = prices.get(c["appid"])
         if not p: continue
         pr = p["prices"]
@@ -330,7 +352,7 @@ def main():
         retail, keyshop, lo_r, lo_k = (x if x and x > 0 else None for x in (f(pr["currentRetail"]), f(pr["currentKeyshops"]),
                                                                             f(pr["historicalRetail"]), f(pr["historicalKeyshops"])))
         if a.steam_keys:                          # gg.deals' store price may be GOG/Epic; use the Steam-key shops' instead
-            retail = skeys.get(c["appid"], (None,))[0]
+            retail = sk[0] if sk else None
         if retail is None and keyshop is None: continue
         if retail is not None and (keyshop is None or keyshop > retail - max(0.5, 0.1 * retail)):
             best, src = retail, "store"          # keyshop must beat store by >10% (min $0.50) to be worth the risk

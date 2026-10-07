@@ -31,13 +31,14 @@ jobs:
       - name: Top deals (within 15% of historical low)
         env:
           GGDEALS_API_KEY: ${{ secrets.GGDEALS_API_KEY }}
+          ITAD_API_KEY: ${{ secrets.ITAD_API_KEY }}
           STEAM_API_KEY: ${{ secrets.STEAM_API_KEY }}
           STEAM_ID: ${{ secrets.STEAM_ID }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           set +e
           H=data/history
-          python find_deals.py --pages 15 --stores 1 --gg-cache $H/gg_cache.json --buy-now 15 --min-score 2 --top 15 --steam-keys --bundles --discord --state $H/posted.json --history $H --csv $H/new.csv > data/run.log 2>&1
+          python find_deals.py --pages 20 --gg-cache $H/gg_cache.json --buy-now 15 --min-score 2 --top 15 --steam-keys --bundles --discord --state $H/posted.json --history $H --csv $H/new.csv > data/run.log 2>&1
           rc=$?
           [ $rc = 0 ] && mv $H/new.csv $H/latest.csv && cp $H/latest.csv "$H/$(date -u +%F).csv"
           echo "rc=$rc" >> "$GITHUB_ENV"
