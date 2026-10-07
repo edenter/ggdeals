@@ -9,7 +9,7 @@ permissions:
   contents: read
   actions: write   # keepalive below: re-enabling resets GitHub's 60-day inactivity timer for scheduled workflows
 
-concurrency:
+concurrency:   # a manual run waits for a scheduled one (and vice versa)
   group: deals
 
 jobs:
