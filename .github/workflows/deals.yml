@@ -1,0 +1,60 @@
+name: Steam deals
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"   # every 2 hours, on the hour (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write   # keepalive below: re-enabling resets GitHub's 60-day inactivity timer for scheduled workflows
+
+concurrency:
+  group: deals
+
+jobs:
+  deals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: edenter/ggdeals-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # This repo is public, so its logs are too: all script output goes to run.log in the private data repo,
+      # and only pass/fail shows here.
+      - name: Top deals (within 15% of historical low)
+        env:
+          GGDEALS_API_KEY: ${{ secrets.GGDEALS_API_KEY }}
+          STEAM_API_KEY: ${{ secrets.STEAM_API_KEY }}
+          STEAM_ID: ${{ secrets.STEAM_ID }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          set +e
+          H=data/history
+          python find_deals.py --pages 15 --stores 1 --gg-cache $H/gg_cache.json --buy-now 15 --min-score 2 --top 15 --steam-keys --bundles --discord --state $H/posted.json --history $H --csv $H/new.csv > data/run.log 2>&1
+          rc=$?
+          [ $rc = 0 ] && mv $H/new.csv $H/latest.csv && cp $H/latest.csv "$H/$(date -u +%F).csv"
+          echo "rc=$rc" >> "$GITHUB_ENV"
+          echo "find_deals.py exit code $rc (output in ggdeals-data/run.log)"
+      - name: Save history and log to ggdeals-data
+        if: always()
+        working-directory: data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A history run.log
+          git commit -q -m "deals $(date -u +%F)" || echo "no changes"
+          git pull -q --rebase && git push -q
+      - name: Keep the schedule active
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable deals.yml -R "$GITHUB_REPOSITORY" > /dev/null
+      - name: Fail if the script failed
+        if: env.rc != '0'
+        run: exit 1

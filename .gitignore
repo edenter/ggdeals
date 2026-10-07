@@ -1,0 +1,8 @@
+.env
+deals.csv
+__pycache__/
+daily.log
+history/
+out/
+data/
+run.log
