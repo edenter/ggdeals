@@ -295,7 +295,7 @@ def main():
     ap.add_argument("--min-rating", type=int, default=85)
     ap.add_argument("--min-reviews", type=int, default=1000)
     ap.add_argument("--max-price", type=float, default=30)
-    ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--top", type=int, default=15, help="Show/post the top N GOOD rows; BUY rows are always included")
     ap.add_argument("--ids", nargs="*", help="Specific Steam AppIDs instead of discovery")
     ap.add_argument("--csv")
     ap.add_argument("--include-owned", action="store_true", help="Don't filter out games in your Steam library")
@@ -372,14 +372,17 @@ def main():
     if a.history:
         hist, today = price_history(a.history), time.strftime("%Y-%m-%d", time.gmtime())
         for r in rows: r["repeats"] = prior_sales(hist.get(r["appid"], []), r["best"], today)
+    # --top caps only the GOOD rows: a BUY ranked below the top N by score still gets shown and posted
+    good = {r["appid"] for r in [r for r in rows if r["tier"] != "BUY"][:a.top]}
+    shown = [r for r in rows if r["tier"] == "BUY" or r["appid"] in good]
     bundles = {}
-    if a.bundles and rows:
-        try: bundles = steam_bundles([r["appid"] for r in rows[:a.top]], owned)
+    if a.bundles and shown:
+        try: bundles = steam_bundles([r["appid"] for r in shown], owned)
         except Exception as e: print(f"bundle lookup failed: {e}", file=sys.stderr)
 
     hdr = f"{'Score':>6} {'Best':>7} {'Src':7} {'Store':>7} {'Key':>7} {'Low':>7} {'vsLow':>6} {'Rate':>4} {'Revs':>7} {'Year':>4} {'Tier':4} {'Rpt':>3}  Title"
     print(hdr); print("-" * len(hdr))
-    for r in rows[:a.top]:
+    for r in shown:
         vs = f"{(r['best']/r['low']-1)*100:+.0f}%" if r["low"] else "  n/a"
         print(f"{r['score']:>6.2f} {r['best']:>7.2f} {r['src']:7} {r['retail'] or 0:>7.2f} {r['keyshop'] or 0:>7.2f} "
               f"{(r['low'] or 0):>7.2f} {vs:>6} {r['rating']:>4} {r['reviews']:>7} {r['year'] or '-':>4} {r['tier']:4} {r.get('repeats', '-'):>3}  {r['title'][:40]}")
@@ -390,7 +393,7 @@ def main():
     if a.discord:
         hook = os.environ.get("DISCORD_WEBHOOK")
         if not hook: sys.exit("Set DISCORD_WEBHOOK in .env")
-        post = rows[:a.top]
+        post = shown
         label = "Wishlist" if a.wishlist else "Top Steam deals"
         if a.state:
             # Remember what was announced and at what price: a deal is posted once, then again only when it
@@ -408,7 +411,7 @@ def main():
                     tag = "NEW LOW" if r["low"] and r["best"] <= r["low"] else f"drop from ${old:.2f}"
                     kept.append({**r, "tag": tag})
             post = kept
-            label = f"New deals ({len(post)}) - {len(rows[:a.top]) - len(post)} still on sale from before"
+            label = f"New deals ({len(post)}) - {len(shown) - len(post)} still on sale from before"
         else:
             label = f"{label} ({len(post)})"
         if a.state and not post:
