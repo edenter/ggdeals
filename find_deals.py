@@ -145,7 +145,8 @@ def gg_prices(key, appids, cache_path=None, budget=None, max_age=12):
     return {a: cache[a]["data"] for a in appids if a in cache and cache[a]["data"]}
 
 STEAM = "https://api.steampowered.com"
-STATE_DAYS = 45  # forget a posted deal after this long so the next sale can announce it again
+STATE_DAYS = 45    # forget a posted deal once it hasn't been on sale for this long
+COMEBACK_DAYS = 2  # a posted deal that was gone this many days and is back on sale gets announced again
 
 def steam_owned(key, sid):
     r = get(f"{STEAM}/IPlayerService/GetOwnedGames/v1/", {"key": key, "steamid": sid, "include_played_free_games": 1, "format": "json"})
@@ -396,20 +397,24 @@ def main():
         post = shown
         label = "Wishlist" if a.wishlist else "Top Steam deals"
         if a.state:
-            # Remember what was announced and at what price: a deal is posted once, then again only when it
-            # is >=5% cheaper than when last posted. Entries expire so a later sale can announce it again.
-            today = time.strftime("%Y-%m-%d", time.gmtime())
-            cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - STATE_DAYS * 86400))
+            # Remember what was announced, at what price, and when it was last on sale: a deal is posted once,
+            # then again when it is >=5% cheaper than when last posted, or when it comes back after being gone.
+            day = lambda days: time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
+            today, cutoff, back = day(0), day(STATE_DAYS), day(COMEBACK_DAYS - 1)
             state = json.load(open(a.state, encoding="utf-8")) if os.path.exists(a.state) else {}
-            state = {k: v for k, v in state.items() if v["date"] >= cutoff}
+            state = {k: v for k, v in state.items() if v.get("seen", v["date"]) >= cutoff}
             kept = []
             for r in post:
-                old = state.get(r["appid"], {}).get("best")
+                old = state.get(r["appid"])
                 if old is None:
                     kept.append(r)                                      # not announced recently
-                elif r["best"] <= old * 0.95:                           # >=5% cheaper than last announced
-                    tag = "NEW LOW" if r["low"] and r["best"] <= r["low"] else f"drop from ${old:.2f}"
+                elif r["best"] <= old["best"] * 0.95:                   # >=5% cheaper than last announced
+                    tag = "NEW LOW" if r["low"] and r["best"] <= r["low"] else f"drop from ${old['best']:.2f}"
                     kept.append({**r, "tag": tag})
+                elif old.get("seen", today) < back:                     # gone a while, now back on sale
+                    kept.append({**r, "tag": f"back (last seen {old['seen']})"})
+            for r in rows:
+                if r["appid"] in state: state[r["appid"]]["seen"] = today
             post = kept
             label = f"New deals ({len(post)}) - {len(shown) - len(post)} still on sale from before"
         else:
@@ -420,7 +425,7 @@ def main():
             discord_post(hook, label, post, bundles)
             print("Posted to Discord")
         if a.state:
-            for r in post: state[r["appid"]] = {"best": r["best"], "date": today, "title": r["title"]}
+            for r in post: state[r["appid"]] = {"best": r["best"], "date": today, "seen": today, "title": r["title"]}
             with open(a.state, "w", encoding="utf-8") as fh: json.dump(state, fh, indent=1, sort_keys=True)
 
     if a.csv:
